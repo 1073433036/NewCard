@@ -1,0 +1,348 @@
+package com.bmac.sparktask;
+
+import com.alibaba.fastjson.JSONObject;
+import com.bmac.conf.ConfigurationManager;
+import com.bmac.constant.Constants;
+import com.bmac.dao.impl.MyTestStreamingListener;
+import com.bmac.entity.SoAndroidError;
+import com.bmac.entity.SoEarlyWarning;
+import com.bmac.utils.DingTalkUtils;
+import com.bmac.utils.MyBatisUtils;
+import com.bmac.utils.RedisUtils;
+import com.bmac.utils.SparkUtils;
+
+import kafka.serializer.StringDecoder;
+
+import org.apache.ibatis.session.SqlSession;
+import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.api.java.function.PairFlatMapFunction;
+import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.api.java.function.VoidFunction;
+import org.apache.spark.storage.StorageLevel;
+import org.apache.spark.streaming.Durations;
+import org.apache.spark.streaming.api.java.JavaPairDStream;
+import org.apache.spark.streaming.api.java.JavaPairInputDStream;
+import org.apache.spark.streaming.api.java.JavaStreamingContext;
+import org.apache.spark.streaming.kafka.KafkaUtils;
+
+import scala.Serializable;
+import scala.Tuple2;
+
+import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+/**
+ * @Author: zqk
+ * @Date: 2018/12/01 10:59
+ * @Description: 交易错误数
+ */
+
+public class TenMinuteExceptionMonitor implements Serializable{
+
+    private static final long serialVersionUID = 8016728007281902043L;
+    private String group = ConfigurationManager.getProperty(Constants.EXCEPTION_GROUP_ID);
+    private  int rate;//频率 10分钟(标准条件)
+    private  int exceptionTimes;//10分钟内5次异常(标准条件)
+
+    int warnningQuota,warnningDataId = 0; 
+    int flagStatus = 2; //系统状态解除报警标识及操作状态标识
+    int flagOperStatus; //人工解除预警标识
+    public void tenMinuteExceptionMonitor() {
+        SparkConf conf = new SparkConf()
+                .setAppName(Constants.EXCEPTION_APP_NAME);
+//                .set("spark.cores.max", "2")
+//                .setMaster(Constants.MASTER);
+
+        SparkUtils.setMaster(conf);
+        JavaStreamingContext jsc = new JavaStreamingContext(conf, Durations.seconds(10));
+
+        //时间监听
+        final MyTestStreamingListener myTestStreamingListener = new MyTestStreamingListener();
+        jsc.addStreamingListener(myTestStreamingListener);
+        //构建请求kafka的参数
+        Map<String, String> kafkaParams = new HashMap<String, String>();
+        kafkaParams.put(Constants.KAFKA_BROKER_LIST, ConfigurationManager.getProperty(Constants.KAFKA_META_BROKER_LIST));
+        kafkaParams.put("group.id", group);
+        kafkaParams.put("enable.auto.commit", "true"); //使用kafka自动提交模式，由应用程序自己接管offset
+
+        System.out.println(kafkaParams);
+        // 构建topics
+        String kafkaTopics = ConfigurationManager.getProperty(Constants.KAFKA_TOPICS);
+        String[] kafkaTopicSplited = kafkaTopics.split(",");
+        
+        // 存储topics
+        Set<String> topics = new HashSet<String>();
+        for (String topic : kafkaTopicSplited) {
+            topics.add(topic);
+        }
+
+        //以Direct的方式读取
+        JavaPairInputDStream<String, String> realTimeDStream = KafkaUtils.createDirectStream(
+        		jsc,
+        		String.class,
+                String.class,
+                StringDecoder.class,
+                StringDecoder.class,
+                kafkaParams,
+                topics
+                );
+        realTimeDStream.print();
+        rate = RedisUtils.getTakeRateException();
+
+        //设置窗口函数
+        JavaPairDStream<String, String> realTimeDstreamWindow = realTimeDStream.window(
+                Durations.minutes(Long.valueOf(rate)),Durations.seconds(Constants.SPARK_DURATION_SECONDS));
+       
+        System.out.println("获取数据");
+        realTimeDstreamWindow.print();
+
+        //需要先按时间对数据进行过滤(防止OGG宕机,然后推过来历史数据)
+        JavaPairDStream<String, String> realTimeDstreamWindowFilterd = realTimeDstreamWindow.filter(new Function<Tuple2<String,String>, Boolean>() {
+			private static final long serialVersionUID = 1L;
+			SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+			public Boolean call(Tuple2<String, String> tuple2) throws Exception {
+		        try {
+		        	long time = myTestStreamingListener.getWatchStartTime().getTime();
+			        long timeStar = time - (rate * 60 * 1000);
+
+					JSONObject jsonObject = JSONObject.parseObject(tuple2._2);
+					String errorTime = jsonObject.getString("ErrorTime");
+					long errorTime1 = format.parse(errorTime.substring(0, 19)).getTime();
+					return errorTime1 >= timeStar;
+		        }catch(Exception e) {
+		        	return false;
+		        }
+			}
+		});
+        //Exception
+        //生成(response_code, 所有字段的数据)
+        JavaPairDStream<String, String> lines = realTimeDstreamWindowFilterd.flatMapToPair(new PairFlatMapFunction<Tuple2<String,String>, String, String>() {
+			private static final long serialVersionUID = 1L;
+			@SuppressWarnings("unchecked")
+			public Iterator<Tuple2<String, String>> call(Tuple2<String, String> tuple2) throws Exception {
+				try {
+					JSONObject jsonObject = JSONObject.parseObject(tuple2._2);
+	                String responseCode = jsonObject.getString("ResponseCode"); 
+	                return Arrays.asList(new Tuple2<String, String>(responseCode, tuple2._2)).iterator();
+				}catch(Exception e) {
+					return null;
+				}
+			}
+		});
+
+        //过滤数据
+        JavaPairDStream<String, String> responseCodeNotInTarget = lines.filter(new Function<Tuple2<String, String>, Boolean>() {
+            private static final long serialVersionUID = 3952246369368747636L;
+
+			public Boolean call(Tuple2<String, String> tuple2) throws Exception {
+                String responseCode = tuple2._1;
+                return !responseCode.equals("0198") && !responseCode.equals("0199") &&
+                        !responseCode.equals("0298") && !responseCode.equals("0299") &&
+                        !responseCode.equals("4998") && !responseCode.equals("4999") &&
+                        !responseCode.equals("0181") && !responseCode.equals("0182") &&
+                        !responseCode.equals("0183") && !responseCode.equals("0185") &&
+                        !responseCode.equals("0186") && !responseCode.equals("0188");
+            }
+        });
+
+        //将过滤的数据缓存起来，一个是so_early_warnning要用到，一个是so_android_error要用
+        JavaPairDStream<String, String> persist = responseCodeNotInTarget.persist(StorageLevel.MEMORY_AND_DISK());
+
+        //将数据生成("timeOut", 1)的数据，进行聚合
+        JavaPairDStream<String, Integer> errorNumTuple = persist.mapToPair(new PairFunction<Tuple2<String, String>, String, Integer>() {
+            private static final long serialVersionUID = -6288055682090558568L;
+
+			public Tuple2<String, Integer> call(Tuple2<String, String> tuple2) throws Exception {
+
+                return new Tuple2<String, Integer>("timeOut", 1);
+            }
+        });
+
+        //聚合
+        JavaPairDStream<String, Integer> errorNumTupleSumd =  errorNumTuple.reduceByKey(new Function2<Integer, Integer, Integer>() {
+            private static final long serialVersionUID = -7207158770759333378L;
+
+			public Integer call(Integer v1, Integer v2) throws Exception {
+
+                return v1 + v2;
+            }
+        });
+
+        //将数据存储
+        errorNumTupleSumd.foreachRDD(new VoidFunction<JavaPairRDD<String, Integer>>() {
+            private static final long serialVersionUID = 4209766177770847319L;
+
+			public void call(JavaPairRDD<String, Integer> rdd) throws Exception {
+                List<Tuple2<String, Integer>> collect = rdd.collect();
+                SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                int errorNum = 0; //条件 5次
+                //从redis中拿取操作状态值，如果是人工解除预警，将预警下的status
+                //将它的状态改为人工解除预警 2 也不用发送钉钉
+                flagOperStatus = RedisUtils.getExceptionNumOperStatus();
+                System.out.println(flagOperStatus);
+                for (Tuple2<String, Integer> tuple2 : collect) {
+                	// 从redis中取值(标准值比较值 错误数)
+                    exceptionTimes = RedisUtils.getwarningPresentExceptionNum();
+                    errorNum = tuple2._2;
+                    SoEarlyWarning soEarlyWarning = new SoEarlyWarning();
+                    Date errorTime = new Date(System.currentTimeMillis());
+                    if (errorNum >= Long.valueOf(exceptionTimes)) {
+                        //soEarlyWarning
+                        warnningQuota = errorNum;
+                        soEarlyWarning.setQuotaCode("YJ005");
+                        soEarlyWarning.setQuotaPresent(errorNum);
+                        soEarlyWarning.setWarningPresent(exceptionTimes);
+						soEarlyWarning.setStatus(0); //报警
+	                    flagStatus = 0;
+                        soEarlyWarning.setType("34");//android指标
+                        soEarlyWarning.setCreateTime(errorTime);
+                        soEarlyWarning.setCreateUser("ExceptionMonitor");
+						soEarlyWarning.setOperStatus(0); //预警未解除
+                        soEarlyWarning.setUpdateTime(errorTime);
+                        soEarlyWarning.setUpdateUser("ExceptionMonitor");
+
+                        SqlSession sqlSession = MyBatisUtils.getSqlSession();
+                        sqlSession.insert("insertToSoEarlyWarning", soEarlyWarning);
+                        try {
+                            sqlSession.commit();
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }finally {
+                            sqlSession.close();
+                        }
+
+                        warnningDataId = soEarlyWarning.getId();
+                    }else if(errorNum > 0 && errorNum < Long.valueOf(exceptionTimes)){
+                        //soEarlyWarning
+                        warnningQuota = errorNum;
+                        soEarlyWarning.setQuotaCode("YJ005");
+                        soEarlyWarning.setQuotaPresent(errorNum);
+                        soEarlyWarning.setWarningPresent(exceptionTimes);
+                        if (flagStatus == 0) {
+                            soEarlyWarning.setStatus(1); //解除
+                        } else {
+                            soEarlyWarning.setStatus(2); //正常
+                        }
+                        soEarlyWarning.setType("34");//android指标
+                        soEarlyWarning.setCreateTime(errorTime);
+                        soEarlyWarning.setCreateUser("ExceptionMonitor");
+                        if (flagStatus == 0) {
+                            soEarlyWarning.setOperStatus(1); //系统自动解除预警
+                            flagStatus = 1;
+                        } else {
+                            soEarlyWarning.setOperStatus(3); //正常
+                            flagStatus = 2;
+                        }
+                        soEarlyWarning.setUpdateTime(errorTime);
+                        soEarlyWarning.setUpdateUser("ExceptionMonitor");
+
+                        SqlSession sqlSession = MyBatisUtils.getSqlSession();
+                        sqlSession.insert("insertToSoEarlyWarning", soEarlyWarning);
+                        try {
+                            sqlSession.commit();
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }finally {
+                            sqlSession.close();
+                        }
+                        warnningDataId = soEarlyWarning.getId();
+                    }
+                    
+                    //数据插入数据库后，按条件进行预警
+                    if (flagOperStatus == 2) { //是从redis里拿的数据
+                        //donothing 不发预警了
+                    } else {
+                        if (flagStatus == 0 && errorNum >= Long.valueOf(exceptionTimes)) { //预警
+                            String message = "{'msgtype':'text','text':{'content':"
+                                    + "'服务器:安卓TSM平台"
+                                    + "\\r\\n发生了:交易错误数报警"
+                                    + "\\r\\n故障级别:报警/P3"
+                                    + "\\r\\n故障状态:PROBLEM"
+                                    + "\\r\\n内容为:当前" + rate + "分钟内,交易错误次数为" + errorNum + "次;"
+                                    + "当前报警指标值为" + exceptionTimes + "次;" + "创建预警时间为" + simpleDateFormat.format(errorTime)
+                                    + "\\r\\n事件ID:" + warnningDataId +"'}}";
+                            DingTalkUtils.earlyWarning(message);
+                        } else if (flagStatus == 1 && errorNum > 0 && errorNum < Long.valueOf(exceptionTimes)) { //系统自动解除预警
+                            String message = "{'msgtype':'text','text':{'content':"
+                                    + "'服务器:安卓TSM平台"
+                                    + "\\r\\n发生了:交易错误数报警自动解除" 
+                                    + "\\r\\n故障级别:解除/P3"
+                                    + "\\r\\n故障状态:OK"
+                                    + "\\r\\n内容为:当前" + rate + "分钟内,交易错误次数为" + errorNum + "次;"
+                                    + "当前报警指标值为" + exceptionTimes + "次;" + "解除预警时间为" + simpleDateFormat.format(errorTime)
+                                    + "\\r\\n事件ID:" + warnningDataId +"'}}";
+                            DingTalkUtils.earlyWarning(message);
+                        }
+                    }
+                }
+            }
+        });
+
+        //将明细数据走so_android_time库
+        persist.foreachRDD(new VoidFunction<JavaPairRDD<String, String>>() {
+            private static final long serialVersionUID = 2572855772563032098L;
+
+			public void call(JavaPairRDD<String, String> rdd) throws Exception {
+                List<Tuple2<String, String>> collect = rdd.collect();
+                System.out.println("明细数据");
+                SqlSession sqlSession1 = MyBatisUtils.getSqlSession();
+                for (Tuple2<String, String> tuple2 : collect) {
+                    JSONObject jsonObject = JSONObject.parseObject(tuple2._2);
+                    Date createTime = new Date(System.currentTimeMillis());
+                    //正常情况下 用jsonObject.get()得到它的明细数据，给它封装到对象中
+                    SoAndroidError soAndroidError = new SoAndroidError();
+                    // 正常情况
+                    soAndroidError.setSellNo(jsonObject.getString("SellNo"));
+                    soAndroidError.setCardCode(jsonObject.getString("CardCode"));
+                    soAndroidError.setUserMobile(jsonObject.getString("UserMobile"));
+                    soAndroidError.setDeviceID(jsonObject.getString("DeviceId"));
+                    soAndroidError.setResponseCode(tuple2._1);
+                    soAndroidError.setMessage(jsonObject.getString("Message"));
+                    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+
+                    soAndroidError.setErrorTime(sdf.parse((jsonObject.getString("ErrorTime")).substring(0, 19)));
+                    soAndroidError.setQuotaPresent(warnningQuota);
+                    soAndroidError.setCreateTime(createTime);
+                    
+            		long time = myTestStreamingListener.getWatchStartTime().getTime();
+            		long timeStar = time - (rate * 60 * 1000);
+            		System.out.println("后来" + timeStar);
+                    soAndroidError.setStartTime(new Timestamp(timeStar));
+                    soAndroidError.setEndTime(new Timestamp(time));
+                    soAndroidError.setWariningID(warnningDataId);
+
+                    sqlSession1.insert("insertToSoAndroidError",soAndroidError);
+                }
+                try {
+                    sqlSession1.commit();
+                } catch (Exception e) {
+                	sqlSession1.rollback();
+                    e.printStackTrace();
+                }finally {
+                    sqlSession1.close();
+                }
+            }
+        });
+        
+        //使用完释放缓存
+        persist.foreachRDD(new VoidFunction<JavaPairRDD<String,String>>() {
+
+			private static final long serialVersionUID = 3730252459143368671L;
+
+			public void call(JavaPairRDD<String, String> rdd) throws Exception {
+				rdd.unpersist();
+			}
+		});
+
+        jsc.start();
+        try {
+			jsc.awaitTermination();
+		} catch (InterruptedException e) {
+		}
+        jsc.stop();
+    }
+}

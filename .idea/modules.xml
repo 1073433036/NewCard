@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/TSMNewCards/TSMNewCards (1).iml" filepath="$PROJECT_DIR$/TSMNewCards/TSMNewCards (1).iml" />
+      <module fileurl="file://$PROJECT_DIR$/TSMNewCards/target/classes/META-INF/maven/com.bmac/TSMNewCards/TSMNewCards (2).iml" filepath="$PROJECT_DIR$/TSMNewCards/target/classes/META-INF/maven/com.bmac/TSMNewCards/TSMNewCards (2).iml" />
+      <module fileurl="file://$PROJECT_DIR$/TSMNewCards/target/classes/META-INF/maven/com.bmac/TSMNewCards/TSMNewCards (3).iml" filepath="$PROJECT_DIR$/TSMNewCards/target/classes/META-INF/maven/com.bmac/TSMNewCards/TSMNewCards (3).iml" />
+      <module fileurl="file://$PROJECT_DIR$/TSMNewCards/target/maven-archiver/maven-archiver.iml" filepath="$PROJECT_DIR$/TSMNewCards/target/maven-archiver/maven-archiver.iml" />
+    </modules>
+  </component>
+</project>
